@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import bcrypt from "bcryptjs";
+import { randomUUID } from "node:crypto";
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
@@ -190,9 +191,27 @@ async function main() {
   }
 
   // --- Guardians & students ---
+  // Individual creates stay per-student (we need the returned student.id for
+  // relations), but the high-volume child records (attendance, invoices,
+  // payments) are batched into a handful of createMany calls at the end —
+  // over a remote DB, thousands of tiny sequential round-trips would
+  // otherwise turn a few-second local seed into a 20+ minute one.
   const studentCount = 100;
   const sectionsByClass = await prisma.section.findMany();
   let invoiceCounter = 1;
+  const attendanceRows: { studentId: string; date: Date; status: "PRESENT" | "LATE" | "ABSENT" | "EXCUSED" }[] = [];
+  const invoiceRows: {
+    id: string;
+    invoiceNumber: string;
+    studentId: string;
+    academicYearId: string;
+    termName: string;
+    totalAmount: number;
+    amountPaid: number;
+    status: "PAID" | "PARTIAL" | "UNPAID";
+    dueDate: Date;
+  }[] = [];
+  const paymentRows: { invoiceId: string; amount: number; method: string; paidAt: Date }[] = [];
 
   for (let i = 0; i < studentCount; i++) {
     const gender: "MALE" | "FEMALE" = Math.random() > 0.5 ? "FEMALE" : "MALE";
@@ -248,9 +267,7 @@ async function main() {
       if (date.getDay() === 0 || date.getDay() === 6) continue;
       const roll = Math.random();
       const status = roll < 0.9 ? "PRESENT" : roll < 0.96 ? "LATE" : roll < 0.99 ? "ABSENT" : "EXCUSED";
-      await prisma.attendance.create({
-        data: { studentId: student.id, date, status },
-      });
+      attendanceRows.push({ studentId: student.id, date, status });
     }
 
     // Invoice + payment for this term
@@ -259,18 +276,18 @@ async function main() {
     const paidRatio = Math.random();
     const amountPaid = paidRatio < 0.7 ? total : paidRatio < 0.9 ? total * 0.5 : 0;
     const status = amountPaid >= total ? "PAID" : amountPaid > 0 ? "PARTIAL" : "UNPAID";
+    const invoiceId = randomUUID();
 
-    const invoice = await prisma.invoice.create({
-      data: {
-        invoiceNumber: `INV-${String(invoiceCounter++).padStart(5, "0")}`,
-        studentId: student.id,
-        academicYearId: academicYear.id,
-        termName: "Term 1",
-        totalAmount: total,
-        amountPaid,
-        status,
-        dueDate: new Date("2026-10-15"),
-      },
+    invoiceRows.push({
+      id: invoiceId,
+      invoiceNumber: `INV-${String(invoiceCounter++).padStart(5, "0")}`,
+      studentId: student.id,
+      academicYearId: academicYear.id,
+      termName: "Term 1",
+      totalAmount: total,
+      amountPaid,
+      status,
+      dueDate: new Date("2026-10-15"),
     });
 
     if (amountPaid > 0) {
@@ -278,16 +295,18 @@ async function main() {
       // trend chart has enough history to be meaningful in the demo.
       const fiveMonthsAgo = new Date();
       fiveMonthsAgo.setMonth(fiveMonthsAgo.getMonth() - 5);
-      await prisma.payment.create({
-        data: {
-          invoiceId: invoice.id,
-          amount: amountPaid,
-          method: pick(["Mobile Money", "Cash", "Bank Transfer"]),
-          paidAt: randomDate(fiveMonthsAgo, new Date()),
-        },
+      paymentRows.push({
+        invoiceId,
+        amount: amountPaid,
+        method: pick(["Mobile Money", "Cash", "Bank Transfer"]),
+        paidAt: randomDate(fiveMonthsAgo, new Date()),
       });
     }
   }
+
+  await prisma.attendance.createMany({ data: attendanceRows });
+  await prisma.invoice.createMany({ data: invoiceRows });
+  await prisma.payment.createMany({ data: paymentRows });
 
   // --- Expenses (Phase 3) ---
   const expenseCategories: { category: string; range: [number, number] }[] = [
@@ -299,21 +318,21 @@ async function main() {
   ];
   const sixMonthsAgo = new Date();
   sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const expenseRows = [];
   for (let m = 0; m < 6; m++) {
     for (const { category, range } of expenseCategories) {
       const date = new Date(sixMonthsAgo);
       date.setMonth(date.getMonth() + m);
       date.setDate(5 + Math.floor(Math.random() * 20));
-      await prisma.expense.create({
-        data: {
-          category,
-          description: `${category} — ${date.toLocaleDateString("en-GB", { month: "long", year: "numeric" })}`,
-          amount: Math.round(range[0] + Math.random() * (range[1] - range[0])),
-          date,
-        },
+      expenseRows.push({
+        category,
+        description: `${category} — ${date.toLocaleDateString("en-GB", { month: "long", year: "numeric" })}`,
+        amount: Math.round(range[0] + Math.random() * (range[1] - range[0])),
+        date,
       });
     }
   }
+  await prisma.expense.createMany({ data: expenseRows });
 
   // --- Performance snapshots (school-wide average trend) ---
   await prisma.performanceSnapshot.createMany({
@@ -329,20 +348,20 @@ async function main() {
   const stages: ("INQUIRY" | "APPLIED" | "INTERVIEW" | "ACCEPTED" | "ENROLLED" | "WAITLISTED")[] = [
     "INQUIRY", "APPLIED", "INTERVIEW", "ACCEPTED", "ENROLLED", "WAITLISTED",
   ];
+  const applicantRows = [];
   for (let i = 0; i < 42; i++) {
     const gender = Math.random() > 0.5 ? "F" : "M";
-    await prisma.applicant.create({
-      data: {
-        firstName: pick(gender === "F" ? FIRST_NAMES_F : FIRST_NAMES_M),
-        lastName: pick(LAST_NAMES),
-        parentName: `${pick(LAST_NAMES)} Family`,
-        parentPhone: `+2332${Math.floor(10000000 + Math.random() * 89999999)}`,
-        stage: pick(stages),
-        source: pick(["Website", "Referral", "Walk-in", "Social Media"]),
-        academicYearId: academicYear.id,
-      },
+    applicantRows.push({
+      firstName: pick(gender === "F" ? FIRST_NAMES_F : FIRST_NAMES_M),
+      lastName: pick(LAST_NAMES),
+      parentName: `${pick(LAST_NAMES)} Family`,
+      parentPhone: `+2332${Math.floor(10000000 + Math.random() * 89999999)}`,
+      stage: pick(stages),
+      source: pick(["Website", "Referral", "Walk-in", "Social Media"]),
+      academicYearId: academicYear.id,
     });
   }
+  await prisma.applicant.createMany({ data: applicantRows });
 
   // --- Events ---
   const now = new Date();
@@ -583,23 +602,23 @@ async function main() {
     ["10:45", "11:30"],
   ];
 
+  const timetableRows = [];
   for (const cls of classes) {
     for (const day of weekDays) {
       for (const [i, [start, end]] of periods.entries()) {
         const subject = subjects[(cls.order + day + i) % subjects.length];
-        await prisma.timetableSlot.create({
-          data: {
-            classId: cls.id,
-            subjectId: subject.id,
-            teacherId: pickAvailableTeacher(subject.id, day, start),
-            dayOfWeek: day,
-            startTime: start,
-            endTime: end,
-          },
+        timetableRows.push({
+          classId: cls.id,
+          subjectId: subject.id,
+          teacherId: pickAvailableTeacher(subject.id, day, start),
+          dayOfWeek: day,
+          startTime: start,
+          endTime: end,
         });
       }
     }
   }
+  await prisma.timetableSlot.createMany({ data: timetableRows });
 
   // --- Assessments, scores, report card remarks & assignments (Phase 2) ---
   const gradedSubjects = subjects.slice(0, 3);
@@ -609,6 +628,33 @@ async function main() {
     { type: "TEST", name: "Class Test", weight: 20 },
     { type: "EXAM", name: "End of Term Exam", weight: 50 },
   ];
+
+  const assessmentRows: {
+    id: string;
+    name: string;
+    type: "CLASSWORK" | "ASSIGNMENT" | "TEST" | "EXAM";
+    weight: number;
+    classId: string;
+    subjectId: string;
+    termName: string;
+    academicYearId: string;
+  }[] = [];
+  const scoreRows: { assessmentId: string; studentId: string; score: number }[] = [];
+  const reportCardRows: {
+    studentId: string;
+    academicYearId: string;
+    termName: string;
+    classTeacherComment: string;
+    headteacherComment: string;
+  }[] = [];
+  const assignmentRows: {
+    title: string;
+    instructions: string;
+    classId: string;
+    subjectId: string;
+    dueDate: Date;
+  }[] = [];
+  const studentScoreTotals = new Map<string, { sum: number; count: number }>();
 
   for (const cls of classes) {
     const classEnrollments = await prisma.enrollment.findMany({
@@ -624,34 +670,37 @@ async function main() {
       );
 
       for (const def of assessmentDefs) {
-        const assessment = await prisma.assessment.create({
-          data: {
-            name: `${def.name} — ${subject.name}`,
-            type: def.type,
-            weight: def.weight,
-            classId: cls.id,
-            subjectId: subject.id,
-            termName: "Term 1",
-            academicYearId: academicYear.id,
-          },
+        const assessmentId = randomUUID();
+        assessmentRows.push({
+          id: assessmentId,
+          name: `${def.name} — ${subject.name}`,
+          type: def.type,
+          weight: def.weight,
+          classId: cls.id,
+          subjectId: subject.id,
+          termName: "Term 1",
+          academicYearId: academicYear.id,
         });
 
         for (const e of classEnrollments) {
           const ability = abilityByStudent.get(e.studentId)!;
           const noise = (Math.random() - 0.5) * 20;
           const score = Math.max(20, Math.min(100, Math.round(ability + noise)));
-          await prisma.score.create({
-            data: { assessmentId: assessment.id, studentId: e.studentId, score },
-          });
+          scoreRows.push({ assessmentId, studentId: e.studentId, score });
+
+          const totals = studentScoreTotals.get(e.studentId) ?? { sum: 0, count: 0 };
+          totals.sum += score;
+          totals.count += 1;
+          studentScoreTotals.set(e.studentId, totals);
         }
       }
     }
 
     // Report card remarks, derived from each student's actual seeded scores.
     for (const e of classEnrollments) {
-      const studentScores = await prisma.score.findMany({ where: { studentId: e.studentId } });
-      if (studentScores.length === 0) continue;
-      const avg = studentScores.reduce((sum, s) => sum + s.score, 0) / studentScores.length;
+      const totals = studentScoreTotals.get(e.studentId);
+      if (!totals || totals.count === 0) continue;
+      const avg = totals.sum / totals.count;
       const classTeacherComment =
         avg >= 80
           ? "An excellent term. Keep up the outstanding work."
@@ -660,30 +709,31 @@ async function main() {
           : avg >= 50
           ? "Satisfactory performance. Needs more consistent effort at home."
           : "Struggling this term — recommend extra support and a parent meeting.";
-      await prisma.reportCardRemark.create({
-        data: {
-          studentId: e.studentId,
-          academicYearId: academicYear.id,
-          termName: "Term 1",
-          classTeacherComment,
-          headteacherComment: avg >= 50 ? "Promoted to the next term." : "Promoted on trial.",
-        },
+      reportCardRows.push({
+        studentId: e.studentId,
+        academicYearId: academicYear.id,
+        termName: "Term 1",
+        classTeacherComment,
+        headteacherComment: avg >= 50 ? "Promoted to the next term." : "Promoted on trial.",
       });
     }
 
     // Assignments (homework) for two of the graded subjects per class.
     for (const subject of gradedSubjects.slice(0, 2)) {
-      await prisma.assignment.create({
-        data: {
-          title: `${subject.name} Homework`,
-          instructions: `Complete the assigned ${subject.name} workbook exercises and submit in class.`,
-          classId: cls.id,
-          subjectId: subject.id,
-          dueDate: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 3 + Math.floor(Math.random() * 10)),
-        },
+      assignmentRows.push({
+        title: `${subject.name} Homework`,
+        instructions: `Complete the assigned ${subject.name} workbook exercises and submit in class.`,
+        classId: cls.id,
+        subjectId: subject.id,
+        dueDate: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 3 + Math.floor(Math.random() * 10)),
       });
     }
   }
+
+  await prisma.assessment.createMany({ data: assessmentRows });
+  await prisma.score.createMany({ data: scoreRows });
+  await prisma.reportCardRemark.createMany({ data: reportCardRows });
+  await prisma.assignment.createMany({ data: assignmentRows });
 
   // --- HR: staff profiles, attendance, leave (Phase 5) ---
   const staffUsers = await prisma.user.findMany({
@@ -709,22 +759,29 @@ async function main() {
   ];
 
   let staffCounter = 1;
+  const staffProfileRows = [];
+  const staffAttendanceRows: {
+    userId: string;
+    date: Date;
+    status: "PRESENT" | "LATE" | "ABSENT";
+    clockIn: Date | null;
+    clockOut: Date | null;
+  }[] = [];
+  const todayForStaff = new Date();
+
   for (const u of staffUsers) {
-    await prisma.staffProfile.create({
-      data: {
-        userId: u.id,
-        staffId: u.teacher?.staffId ?? `STF-A${String(staffCounter++).padStart(3, "0")}`,
-        department: departmentByRole[u.role] ?? "General",
-        qualification: pick(qualifications),
-        employmentDate: randomDate(new Date("2019-01-01"), new Date("2025-06-01")),
-        phone: `+2332${Math.floor(10000000 + Math.random() * 89999999)}`,
-        address: "Oduman, Accra",
-        emergencyContact: `+2332${Math.floor(10000000 + Math.random() * 89999999)}`,
-      },
+    staffProfileRows.push({
+      userId: u.id,
+      staffId: u.teacher?.staffId ?? `STF-A${String(staffCounter++).padStart(3, "0")}`,
+      department: departmentByRole[u.role] ?? "General",
+      qualification: pick(qualifications),
+      employmentDate: randomDate(new Date("2019-01-01"), new Date("2025-06-01")),
+      phone: `+2332${Math.floor(10000000 + Math.random() * 89999999)}`,
+      address: "Oduman, Accra",
+      emergencyContact: `+2332${Math.floor(10000000 + Math.random() * 89999999)}`,
     });
 
     // Attendance for the last 10 working days.
-    const todayForStaff = new Date();
     for (let d = 0; d < 14; d++) {
       const date = new Date(todayForStaff);
       date.setDate(date.getDate() - d);
@@ -735,41 +792,41 @@ async function main() {
       clockIn.setHours(7, 30 + Math.floor(Math.random() * 30), 0, 0);
       const clockOut = new Date(date);
       clockOut.setHours(16, Math.floor(Math.random() * 30), 0, 0);
-      await prisma.staffAttendance.create({
-        data: {
-          userId: u.id,
-          date,
-          status,
-          clockIn: status === "ABSENT" ? null : clockIn,
-          clockOut: status === "ABSENT" ? null : clockOut,
-        },
+      staffAttendanceRows.push({
+        userId: u.id,
+        date,
+        status,
+        clockIn: status === "ABSENT" ? null : clockIn,
+        clockOut: status === "ABSENT" ? null : clockOut,
       });
     }
   }
+  await prisma.staffProfile.createMany({ data: staffProfileRows });
+  await prisma.staffAttendance.createMany({ data: staffAttendanceRows });
 
+  const userByEmail = new Map(staffUsers.map((u) => [u.email, u]));
   const leaveDefs: { email: string; type: "ANNUAL" | "SICK" | "EMERGENCY"; status: "PENDING" | "APPROVED" | "REJECTED"; days: number }[] = [
     { email: "accountant@alphason.edu.gh", type: "ANNUAL", status: "PENDING", days: 5 },
     { email: "librarian@alphason.edu.gh", type: "SICK", status: "APPROVED", days: 2 },
     { email: "hr@alphason.edu.gh", type: "EMERGENCY", status: "REJECTED", days: 1 },
   ];
-  for (const def of leaveDefs) {
-    const leaveUser = await prisma.user.findUniqueOrThrow({ where: { email: def.email } });
+  const leaveRows = leaveDefs.map((def) => {
+    const leaveUser = userByEmail.get(def.email)!;
     const startDate = randomDate(new Date(), new Date(now.getFullYear(), now.getMonth() + 1, 0));
     const endDate = new Date(startDate);
     endDate.setDate(endDate.getDate() + def.days);
-    await prisma.leaveRequest.create({
-      data: {
-        userId: leaveUser.id,
-        type: def.type,
-        startDate,
-        endDate,
-        reason: def.type === "SICK" ? "Feeling unwell, doctor's note attached." : def.type === "EMERGENCY" ? "Family emergency." : "Annual leave request.",
-        status: def.status,
-        reviewedById: def.status === "PENDING" ? null : adminUser.id,
-        reviewNotes: def.status === "APPROVED" ? "Approved, please arrange cover." : def.status === "REJECTED" ? "Too close to end-of-term exams, please reschedule." : null,
-      },
-    });
-  }
+    return {
+      userId: leaveUser.id,
+      type: def.type,
+      startDate,
+      endDate,
+      reason: def.type === "SICK" ? "Feeling unwell, doctor's note attached." : def.type === "EMERGENCY" ? "Family emergency." : "Annual leave request.",
+      status: def.status,
+      reviewedById: def.status === "PENDING" ? null : adminUser.id,
+      reviewNotes: def.status === "APPROVED" ? "Approved, please arrange cover." : def.status === "REJECTED" ? "Too close to end-of-term exams, please reschedule." : null,
+    };
+  });
+  await prisma.leaveRequest.createMany({ data: leaveRows });
 
   // --- Library (Phase 5) ---
   const bookDefs = [
@@ -789,17 +846,18 @@ async function main() {
     ["Creative Arts Handbook", "GES", "Arts"],
     ["Physical Education Manual", "GES", "PE"],
   ];
-  const books = [];
-  for (const [title, author, category] of bookDefs) {
-    const totalCopies = 2 + Math.floor(Math.random() * 4);
-    books.push(
-      await prisma.book.create({
-        data: { title, author, category, publisher: "Ghana Education Service", totalCopies, availableCopies: totalCopies },
-      })
-    );
-  }
+  const books = bookDefs.map(([title, author, category]) => ({
+    id: randomUUID(),
+    title,
+    author,
+    category,
+    publisher: "Ghana Education Service",
+    totalCopies: 2 + Math.floor(Math.random() * 4),
+  }));
+  const copiesOut = new Map(books.map((b) => [b.id, 0]));
 
   const allStudents = await prisma.student.findMany({ take: 40 });
+  const borrowRows = [];
   for (let i = 0; i < 25; i++) {
     const book = pick(books);
     const student = pick(allStudents);
@@ -808,58 +866,45 @@ async function main() {
     dueDate.setDate(dueDate.getDate() + 14);
     const isReturned = Math.random() < 0.6;
 
-    await prisma.borrowRecord.create({
-      data: {
-        bookId: book.id,
-        studentId: student.id,
-        borrowDate,
-        dueDate,
-        returnDate: isReturned ? randomDate(borrowDate, new Date(Math.min(dueDate.getTime(), now.getTime()))) : null,
-      },
+    borrowRows.push({
+      bookId: book.id,
+      studentId: student.id,
+      borrowDate,
+      dueDate,
+      returnDate: isReturned ? randomDate(borrowDate, new Date(Math.min(dueDate.getTime(), now.getTime()))) : null,
     });
 
-    if (!isReturned) {
-      await prisma.book.update({
-        where: { id: book.id },
-        data: { availableCopies: { decrement: 1 } },
-      });
-    }
+    if (!isReturned) copiesOut.set(book.id, (copiesOut.get(book.id) ?? 0) + 1);
   }
-  // Guard against availableCopies going negative if a book was borrowed more than its stock.
-  for (const book of books) {
-    const current = await prisma.book.findUniqueOrThrow({ where: { id: book.id } });
-    if (current.availableCopies < 0) {
-      await prisma.book.update({ where: { id: book.id }, data: { availableCopies: 0 } });
-    }
-  }
+
+  await prisma.book.createMany({
+    data: books.map((b) => ({
+      ...b,
+      availableCopies: Math.max(0, b.totalCopies - (copiesOut.get(b.id) ?? 0)),
+    })),
+  });
+  await prisma.borrowRecord.createMany({ data: borrowRows });
 
   // --- Transport (Phase 5) ---
   const vehicleDefs = [
-    { registrationNumber: "GT 4521-24", vehicleType: "33-seater bus", capacity: 33, driverName: "Mr. Kwesi Boateng", driverPhone: "+233241122334" },
-    { registrationNumber: "GT 7789-23", vehicleType: "18-seater minibus", capacity: 18, driverName: "Mr. Yaw Sarpong", driverPhone: "+233201122335" },
-    { registrationNumber: "GT 2290-25", vehicleType: "33-seater bus", capacity: 33, driverName: "Mr. Kojo Amoah", driverPhone: "+233551122336" },
+    { id: randomUUID(), registrationNumber: "GT 4521-24", vehicleType: "33-seater bus", capacity: 33, driverName: "Mr. Kwesi Boateng", driverPhone: "+233241122334" },
+    { id: randomUUID(), registrationNumber: "GT 7789-23", vehicleType: "18-seater minibus", capacity: 18, driverName: "Mr. Yaw Sarpong", driverPhone: "+233201122335" },
+    { id: randomUUID(), registrationNumber: "GT 2290-25", vehicleType: "33-seater bus", capacity: 33, driverName: "Mr. Kojo Amoah", driverPhone: "+233551122336" },
   ];
-  const vehicles = [];
-  for (const v of vehicleDefs) {
-    vehicles.push(await prisma.vehicle.create({ data: v }));
-  }
+  await prisma.vehicle.createMany({ data: vehicleDefs });
 
   const routeDefs = [
-    { name: "Oduman - Amasaman Route", stops: "Oduman Station, Ofankor, Amasaman Market", pickupTime: "06:00", dropoffTime: "15:30" },
-    { name: "Achimota - Lapaz Route", stops: "Achimota Circle, Lapaz Station, Kwashieman", pickupTime: "06:15", dropoffTime: "15:45" },
-    { name: "Pokuase - Nsawam Road Route", stops: "Pokuase, Ablekuma, Nsawam Road Junction", pickupTime: "06:00", dropoffTime: "15:30" },
+    { id: randomUUID(), name: "Oduman - Amasaman Route", stops: "Oduman Station, Ofankor, Amasaman Market", pickupTime: "06:00", dropoffTime: "15:30" },
+    { id: randomUUID(), name: "Achimota - Lapaz Route", stops: "Achimota Circle, Lapaz Station, Kwashieman", pickupTime: "06:15", dropoffTime: "15:45" },
+    { id: randomUUID(), name: "Pokuase - Nsawam Road Route", stops: "Pokuase, Ablekuma, Nsawam Road Junction", pickupTime: "06:00", dropoffTime: "15:30" },
   ];
-  const routes = [];
-  for (const [i, r] of routeDefs.entries()) {
-    routes.push(await prisma.transportRoute.create({ data: { ...r, vehicleId: vehicles[i % vehicles.length].id } }));
-  }
+  const routes = routeDefs.map((r, i) => ({ ...r, vehicleId: vehicleDefs[i % vehicleDefs.length].id }));
+  await prisma.transportRoute.createMany({ data: routes });
 
   const transportStudents = pickMany(allStudents, 30);
-  for (const student of transportStudents) {
-    await prisma.studentTransport.create({
-      data: { studentId: student.id, routeId: pick(routes).id },
-    });
-  }
+  await prisma.studentTransport.createMany({
+    data: transportStudents.map((student) => ({ studentId: student.id, routeId: pick(routes).id })),
+  });
 
   console.log("Seed complete.");
   console.log(`Students: ${studentCount}, Teachers: ${teacherCount}, Classes: ${classes.length}`);
