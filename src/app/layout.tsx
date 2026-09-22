@@ -29,6 +29,12 @@ export const viewport: Viewport = {
   themeColor: "#0c4a6e",
 };
 
+// Every page here reads live, per-request data (auth session, database
+// records), so nothing should ever be statically prerendered at build time —
+// doing so made the build itself try to query the production database and
+// fail if that connection wasn't available in the build environment.
+export const dynamic = "force-dynamic";
+
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
