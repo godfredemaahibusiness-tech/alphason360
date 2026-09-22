@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { NewStudentForm } from "@/components/students/NewStudentForm";
 
 const PAGE_SIZE = 20;
 
@@ -54,18 +55,12 @@ export default async function StudentsPage({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-slate-900">Students</h1>
-          <p className="text-sm text-slate-500">{total} active students</p>
-        </div>
-        <button
-          type="button"
-          className="text-sm font-medium bg-sky-700 hover:bg-sky-800 text-white rounded-lg px-4 py-2"
-        >
-          Add Student
-        </button>
+      <div>
+        <h1 className="text-xl font-bold text-slate-900">Students</h1>
+        <p className="text-sm text-slate-500">{total} active students</p>
       </div>
+
+      <NewStudentForm classes={classes} />
 
       <form className="flex flex-wrap gap-2 bg-white border border-slate-200 rounded-xl p-3">
         <input
